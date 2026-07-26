@@ -1342,9 +1342,12 @@ impl PlatformInputHandler {
     }
 
     #[allow(dead_code)]
-    pub fn query_prefers_ime_for_printable_keys(&mut self) -> bool {
+    pub fn query_prefers_ime_for_printable_keys(&mut self, keystroke: &Keystroke) -> bool {
         self.cx
-            .update(|window, cx| self.handler.prefers_ime_for_printable_keys(window, cx))
+            .update(|window, cx| {
+                self.handler
+                    .prefers_ime_for_printable_keys(keystroke, window, cx)
+            })
             .unwrap_or(false)
     }
 }
@@ -1461,15 +1464,26 @@ pub trait InputHandler: 'static {
         true
     }
 
-    /// Returns whether printable keys should be routed to the IME before keybinding
+    /// Returns whether this printable key should be routed to the IME before keybinding
     /// matching when a non-ASCII input source (e.g. Japanese, Korean, Chinese IME)
     /// is active. This prevents multi-stroke keybindings like `jj` from intercepting
     /// keys that the IME should compose.
     ///
+    /// The keystroke that triggered the query is passed in so a handler can answer per
+    /// key rather than per view. A terminal, for instance, routes plain text to the IME
+    /// but must keep Option chords for itself when the user has asked for Option-as-Meta
+    /// (⌥B → `ESC b`): the IME would otherwise commit the composed character (`∫`) and
+    /// the chord would never reach the key handler.
+    ///
     /// Defaults to `false`. The editor overrides this based on whether it expects
     /// character input (e.g. Vim insert mode returns `true`, normal mode returns `false`).
     /// The terminal keeps the default `false` so that raw keys reach the terminal process.
-    fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+    fn prefers_ime_for_printable_keys(
+        &mut self,
+        _keystroke: &Keystroke,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> bool {
         false
     }
 }

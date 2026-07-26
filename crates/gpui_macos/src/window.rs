@@ -2143,6 +2143,12 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
             // multi-stroke keybindings like `jj` from intercepting keys that the IME should compose
             // (e.g. typing 'ji' should produce 'じ', not 'jい'). If the IME doesn't handle the key,
             // it calls `doCommandBySelector:` which routes it back to keybinding matching.
+            //
+            // The keystroke is handed to `query_prefers_ime_for_printable_keys` so the handler
+            // can answer per key. Option is deliberately *not* excluded here the way Control /
+            // Fn / Cmd are — ⌥ composes text on macOS, so ⌥-chords are printable keys by
+            // default — but a handler that gives Option a Meta meaning (a terminal's
+            // Option-as-Meta) needs those chords back, and only it knows that.
             let is_ime_printable_key = !is_composing
                 && key_down_event
                     .keystroke
@@ -2154,7 +2160,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 && !key_down_event.keystroke.modifiers.platform
                 && unsafe { is_ime_input_source_active() }
                 && with_input_handler(this, |input_handler| {
-                    input_handler.query_prefers_ime_for_printable_keys()
+                    input_handler.query_prefers_ime_for_printable_keys(&key_down_event.keystroke)
                 })
                 .unwrap_or(false);
 
