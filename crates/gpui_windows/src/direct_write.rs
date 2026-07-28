@@ -75,6 +75,11 @@ struct DirectWriteState {
     custom_font_collection: IDWriteFontCollection1,
     fonts: Vec<FontInfo>,
     font_to_font_id: HashMap<Font, FontId>,
+    /// Font-face COM identity -> the `FontId` we allocated for it.
+    ///
+    /// Invariant: the key is the address of `fonts[value].font_face`. Every entry
+    /// therefore owns the object its key points at, so no later allocation can
+    /// reuse the address and alias the entry onto a different font.
     font_info_cache: HashMap<usize, FontId>,
     layout_line_scratch: Vec<u16>,
 }
@@ -174,7 +179,7 @@ impl DirectWriteTextSystem {
         let mut locale = [0u16; LOCALE_NAME_MAX_LENGTH as usize];
         unsafe { GetUserDefaultLocaleName(&mut locale) };
         let locale = HSTRING::from_wide(&locale);
-        let text_renderer = TextRendererWrapper::new(locale.clone());
+        let text_renderer = TextRendererWrapper::new();
 
         let gpu_state = GPUState::new(directx_devices)?;
 
@@ -345,6 +350,61 @@ impl DirectWriteState {
         let font_id = font_id?;
         self.font_to_font_id.insert(font.clone(), font_id);
         Some(font_id)
+    }
+
+    /// Resolve the `FontId` for a face that DirectWrite chose for us, rather than
+    /// one we asked for by name: the font-fallback path, where a run of text the
+    /// requested family cannot cover gets shaped with some other face entirely.
+    ///
+    /// The run arrives as glyph *indices*, which mean nothing on their own — they
+    /// only address outlines in the one face they were shaped with. So we register
+    /// that exact face. Deriving a `Font` from it and looking a face back up by
+    /// family/weight/style is lossy in both directions, and when the lookup lands
+    /// on a sibling face the failure is silent: every glyph still draws, just the
+    /// wrong one, one-for-one. On screen that reads as an encoding bug rather than
+    /// as a font bug.
+    ///
+    /// Registering the face is also what makes `font_info_cache`'s key sound. The
+    /// key is the face's COM identity, i.e. an address, so the cache has to hold a
+    /// reference to the object living at it; otherwise DirectWrite could release
+    /// the face and a later allocation could reuse the address, silently aliasing
+    /// the entry onto an unrelated font.
+    fn font_id_for_shaped_face(
+        &mut self,
+        components: &DirectWriteComponents,
+        font_face: &IDWriteFontFace3,
+    ) -> windows::core::Result<FontId> {
+        let key = font_face.cast::<IUnknown>()?.as_raw().addr();
+        if let Some(&font_id) = self.font_info_cache.get(&key) {
+            return Ok(font_id);
+        }
+
+        let family_name = unsafe { font_face.GetFamilyNames() }
+            .ok()
+            .and_then(|names| get_name(names, &components.locale).log_err())
+            .unwrap_or_default();
+        // Only consulted if this id is ever handed back to `layout_line`; every
+        // rasterization path reads `font_face` instead. DirectWrite can fall back
+        // to a face outside both collections, in which case neither answer is
+        // meaningful and the system collection is the better guess.
+        let font_collection =
+            if unsafe { self.custom_font_collection.GetFontFromFontFace(font_face) }.is_ok() {
+                self.custom_font_collection.clone()
+            } else {
+                self.system_font_collection.clone()
+            };
+
+        let font_id = FontId(self.fonts.len());
+        self.fonts.push(FontInfo {
+            font_family_h: HSTRING::from(family_name),
+            // Strong reference: this is what pins the address used as `key`.
+            font_face: font_face.clone(),
+            features: unsafe { components.factory.CreateTypography()? },
+            fallbacks: None,
+            font_collection,
+        });
+        self.font_info_cache.insert(key, font_id);
+        Ok(font_id)
     }
 
     fn add_fonts(
@@ -1342,22 +1402,15 @@ struct GlyphLayerTextureParams {
 struct TextRendererWrapper(IDWriteTextRenderer);
 
 impl TextRendererWrapper {
-    fn new(locale_str: HSTRING) -> Self {
-        let inner = TextRenderer::new(locale_str);
-        TextRendererWrapper(inner.into())
+    fn new() -> Self {
+        TextRendererWrapper(TextRenderer.into())
     }
 }
 
+/// Stateless: everything a callback needs arrives through `RendererContext`,
+/// which carries the `DirectWriteComponents` the locale lives on.
 #[implement(IDWriteTextRenderer)]
-struct TextRenderer {
-    locale: HSTRING,
-}
-
-impl TextRenderer {
-    fn new(locale: HSTRING) -> Self {
-        TextRenderer { locale }
-    }
-}
+struct TextRenderer;
 
 struct RendererContext<'t, 'a, 'b> {
     text_system: &'t mut DirectWriteState,
@@ -1489,33 +1542,13 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             ));
         };
 
-        let font_face_key = font_face.cast::<IUnknown>().unwrap().as_raw().addr();
+        // The face here is often one we never created: DirectWrite picks it out of
+        // the fallback chain for text the requested family cannot cover. Register
+        // whatever it handed us, because that is the only face this run's glyph
+        // indices are valid in.
         let font_id = context
             .text_system
-            .font_info_cache
-            .get(&font_face_key)
-            .copied()
-            // in some circumstances, we might be getting served a FontFace that we did not create ourselves
-            // so create a new font from it and cache it accordingly. The usual culprit here seems to be Segoe UI Symbol
-            .map_or_else(
-                || {
-                    let font = font_face_to_font(font_face, &self.locale)
-                        .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?;
-                    let font_id = match context.text_system.font_to_font_id.get(&font) {
-                        Some(&font_id) => font_id,
-                        None => context
-                            .text_system
-                            .select_and_cache_font(context.components, &font)
-                            .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?,
-                    };
-                    context
-                        .text_system
-                        .font_info_cache
-                        .insert(font_face_key, font_id);
-                    windows::core::Result::Ok(font_id)
-                },
-                Ok,
-            )?;
+            .font_id_for_shaped_face(context.components, font_face)?;
 
         let color_font = unsafe { font_face.IsColorFont().as_bool() };
 
@@ -1652,21 +1685,8 @@ fn font_style_to_dwrite(style: FontStyle) -> DWRITE_FONT_STYLE {
     }
 }
 
-fn font_style_from_dwrite(value: DWRITE_FONT_STYLE) -> FontStyle {
-    match value.0 {
-        0 => FontStyle::Normal,
-        1 => FontStyle::Italic,
-        2 => FontStyle::Oblique,
-        _ => unreachable!(),
-    }
-}
-
 fn font_weight_to_dwrite(weight: FontWeight) -> DWRITE_FONT_WEIGHT {
     DWRITE_FONT_WEIGHT(weight.0 as i32)
-}
-
-fn font_weight_from_dwrite(value: DWRITE_FONT_WEIGHT) -> FontWeight {
-    FontWeight(value.0 as f32)
 }
 
 fn get_font_names_from_collection(
@@ -1691,20 +1711,6 @@ fn get_font_names_from_collection(
 
         result
     }
-}
-
-fn font_face_to_font(font_face: &IDWriteFontFace3, locale: &HSTRING) -> Option<Font> {
-    let localized_family_name = unsafe { font_face.GetFamilyNames().log_err() }?;
-    let family_name = get_name(localized_family_name, locale).log_err()?;
-    let weight = unsafe { font_face.GetWeight() };
-    let style = unsafe { font_face.GetStyle() };
-    Some(Font {
-        family: family_name.into(),
-        features: FontFeatures::default(),
-        weight: font_weight_from_dwrite(weight),
-        style: font_style_from_dwrite(style),
-        fallbacks: None,
-    })
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/dwrite/ne-dwrite-dwrite_font_feature_tag
@@ -1879,7 +1885,184 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 
 #[cfg(test)]
 mod tests {
-    use crate::direct_write::ClusterAnalyzer;
+    // Deliberately not `use super::*`: that would pull in `gpui::test`, which
+    // shadows the built-in `#[test]` attribute and blows the macro recursion
+    // limit.
+    use gpui::{
+        Font, FontFallbacks, FontFeatures, FontId, FontRun, FontStyle, FontWeight,
+        PlatformTextSystem, px,
+    };
+    use util::ResultExt;
+    use windows::core::{IUnknown, Interface};
+
+    use crate::DirectXDevices;
+    use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem};
+
+    /// Text that has no coverage in any Latin UI/monospace font, so DirectWrite
+    /// is forced down the font-fallback path to shape it.
+    const CJK: &str = "这一段里的行为有作者的实测截图佐证";
+
+    /// Colour-font fallback lands on the same path, and a colour face swapped for
+    /// a monochrome sibling is the same class of bug.
+    const EMOJI: &str = "ok 🎉 done ✅ 👩‍💻";
+
+    /// The styles a terminal actually asks for, and the ones that exercise the
+    /// fallback face lookup differently.
+    const STYLES: [(FontWeight, FontStyle); 3] = [
+        (FontWeight::NORMAL, FontStyle::Normal),
+        (FontWeight::BOLD, FontStyle::Normal),
+        (FontWeight::NORMAL, FontStyle::Italic),
+    ];
+
+    /// `None` when there is no D3D11 device to build a text system on, e.g. a
+    /// headless CI runner.
+    fn text_system() -> Option<DirectWriteTextSystem> {
+        let devices = DirectXDevices::new().log_err()?;
+        DirectWriteTextSystem::new(&devices).log_err()
+    }
+
+    /// Mirrors what a terminal actually asks for on Windows: a Latin-only
+    /// monospace primary plus an explicit CJK fallback chain.
+    ///
+    /// Which face the chain actually lands on depends on what is installed, so
+    /// how hard these tests press on the fallback path varies by machine — the
+    /// invariants they assert do not. A family that ships a real italic (Maple
+    /// Mono NF CN does) exercises the most of it, because an italic face is what
+    /// a lookup by family/weight/style is least able to find its way back to.
+    fn probe_font(weight: FontWeight, style: FontStyle) -> Font {
+        Font {
+            family: "Consolas".into(),
+            features: FontFeatures::default(),
+            fallbacks: Some(FontFallbacks::from_fonts(vec![
+                "Maple Mono NF CN".into(),
+                "Cascadia Mono".into(),
+                "Microsoft YaHei".into(),
+                "Segoe UI Emoji".into(),
+            ])),
+            weight,
+            style,
+        }
+    }
+
+    fn describe(text_system: &DirectWriteTextSystem, font_id: FontId) -> String {
+        let state = text_system.state.read();
+        let info = &state.fonts[font_id.0];
+        let face_addr = info
+            .font_face
+            .cast::<IUnknown>()
+            .map(|unknown| unknown.as_raw().addr())
+            .unwrap_or(0);
+        format!(
+            "{:?} (family {:?}, face @ {face_addr:#x})",
+            font_id,
+            info.font_family_h.to_string(),
+        )
+    }
+
+    /// A `ShapedRun` reports the `FontId` its glyph indices belong to, and every
+    /// downstream consumer (`rasterize_glyph`, `advance`, `typographic_bounds`)
+    /// looks the face up through exactly that id. So the id has to denote *the
+    /// very face DirectWrite shaped the run with* — glyph indices are meaningless
+    /// in any other face.
+    ///
+    /// When it doesn't, the failure is silent and looks exactly like an encoding
+    /// bug: every CJK codepoint renders as some unrelated CJK glyph, one-for-one,
+    /// consistently, because the wrong face is indexed with the right indices.
+    #[test]
+    fn shaped_run_font_id_denotes_the_face_the_run_was_shaped_with() {
+        let Some(text_system) = text_system() else {
+            return;
+        };
+
+        for (weight, style) in STYLES {
+            let font = probe_font(weight, style);
+            let font_id = text_system.font_id(&font).unwrap();
+            let layout = text_system.layout_line(
+                CJK,
+                px(15.),
+                &[FontRun {
+                    len: CJK.len(),
+                    font_id,
+                }],
+            );
+
+            let mut checked = 0;
+            for run in &layout.runs {
+                assert_ne!(
+                    run.font_id, font_id,
+                    "{weight:?}/{style:?}: expected {CJK:?} to be shaped through the \
+                     fallback chain, not through the Latin-only primary",
+                );
+                for glyph in &run.glyphs {
+                    let ch = CJK[glyph.index..].chars().next().unwrap();
+                    assert_eq!(
+                        text_system.glyph_for_char(run.font_id, ch),
+                        Some(glyph.id),
+                        "{weight:?}/{style:?}: {ch:?} was shaped to glyph {:?}, but that \
+                         glyph id does not map back to {ch:?} in the font the run claims \
+                         it belongs to: {}. The run's glyph indices come from the face \
+                         DirectWrite picked; rasterizing them against a different face \
+                         renders unrelated glyphs.",
+                        glyph.id,
+                        describe(&text_system, run.font_id),
+                    );
+                    checked += 1;
+                }
+            }
+            assert_eq!(
+                checked,
+                CJK.chars().count(),
+                "{weight:?}/{style:?}: every character should have produced one glyph",
+            );
+        }
+    }
+
+    /// `font_info_cache` keys a `FontId` by the *address* of a font face, which is
+    /// only sound while the cache owns a reference to the object living there. A
+    /// key whose face the text system does not hold can be outlived by its own
+    /// pointee: DirectWrite releases the face, some later allocation reuses the
+    /// address, and the cache starts answering with an unrelated font.
+    #[test]
+    fn every_font_face_cache_key_is_owned_by_the_font_it_maps_to() {
+        let Some(text_system) = text_system() else {
+            return;
+        };
+
+        // Populate the cache through both paths: `font_id` (faces we pick by
+        // name) and the fallback path inside `DrawGlyphRun` (faces DirectWrite
+        // picks for us).
+        for (weight, style) in STYLES {
+            let font_id = text_system.font_id(&probe_font(weight, style)).unwrap();
+            for text in [CJK, EMOJI] {
+                text_system.layout_line(
+                    text,
+                    px(15.),
+                    &[FontRun {
+                        len: text.len(),
+                        font_id,
+                    }],
+                );
+            }
+        }
+
+        let state = text_system.state.read();
+        assert!(!state.font_info_cache.is_empty());
+        for (&key, &font_id) in state.font_info_cache.iter() {
+            let owned = state.fonts[font_id.0]
+                .font_face
+                .cast::<IUnknown>()
+                .unwrap()
+                .as_raw()
+                .addr();
+            assert_eq!(
+                key,
+                owned,
+                "cache key {key:#x} maps to {font_id:?} (family {:?}), whose face lives \
+                 at {owned:#x} — the entry does not own the object its key points at",
+                state.fonts[font_id.0].font_family_h.to_string(),
+            );
+        }
+    }
 
     #[test]
     fn test_cluster_map() {
