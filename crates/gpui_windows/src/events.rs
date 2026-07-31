@@ -104,6 +104,7 @@ impl WindowsWindowInner {
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
+            WM_IME_REQUEST => self.handle_ime_request(handle, wparam, lparam),
             WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
@@ -627,6 +628,66 @@ impl WindowsWindowInner {
         }
     }
 
+    // Some IMEs (notably the Windows 11 Microsoft Pinyin IME in its default
+    // mode) ignore the CANDIDATEFORM set at composition start and instead ask
+    // for the caret through IMR_QUERYCHARPOSITION; if the query goes
+    // unanswered they fall back to a default spot near the window's
+    // bottom-right corner.
+    fn handle_ime_request(&self, handle: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        if wparam.0 as u32 != IMR_QUERYCHARPOSITION {
+            return None;
+        }
+        let char_position = unsafe { (lparam.0 as *mut IMECHARPOSITION).as_mut() }?;
+        let queried_index = char_position.dwCharPos as usize;
+        let (origin, line_height) =
+            self.with_input_handler_and_scale_factor(|input_handler, scale_factor| {
+                // dwCharPos is an offset into the composition string; anchor
+                // it at the marked range when there is one, else at the caret.
+                let base = match input_handler.marked_text_range() {
+                    Some(range) => range.start,
+                    None => input_handler.selected_text_range(false)?.range.start,
+                };
+                let index = base + queried_index;
+                let bounds = input_handler.bounds_for_range(index..index)?;
+                Some((
+                    POINT {
+                        x: (bounds.origin.x.as_f32() * scale_factor) as i32,
+                        y: (bounds.origin.y.as_f32() * scale_factor) as i32,
+                    },
+                    (bounds.size.height.as_f32() * scale_factor) as u32,
+                ))
+            })?;
+
+        let mut caret = origin;
+        let mut document = RECT::default();
+        unsafe {
+            ClientToScreen(handle, &mut caret).ok().log_err()?;
+            GetClientRect(handle, &mut document).log_err()?;
+            let mut top_left = POINT {
+                x: document.left,
+                y: document.top,
+            };
+            let mut bottom_right = POINT {
+                x: document.right,
+                y: document.bottom,
+            };
+            ClientToScreen(handle, &mut top_left).ok().log_err()?;
+            ClientToScreen(handle, &mut bottom_right).ok().log_err()?;
+            document = RECT {
+                left: top_left.x,
+                top: top_left.y,
+                right: bottom_right.x,
+                bottom: bottom_right.y,
+            };
+        }
+
+        char_position.dwSize = std::mem::size_of::<IMECHARPOSITION>() as u32;
+        char_position.pt = caret;
+        char_position.cLineHeight = line_height;
+        char_position.rcDocument = document;
+        Some(1)
+    }
+
     fn update_ime_enabled(&self, handle: HWND) {
         let ime_enabled = self
             .with_input_handler(|input_handler| input_handler.query_accepts_text_input())
@@ -655,6 +716,11 @@ impl WindowsWindowInner {
 
     fn handle_ime_composition(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
         let ctx = ImeContext::get(handle)?;
+        // Re-anchor for IMEs that read CANDIDATEFORM: the one-shot sample at
+        // WM_IME_STARTCOMPOSITION goes stale if the content moved since.
+        if let Some(caret_position) = self.retrieve_caret_position() {
+            self.update_ime_position(handle, caret_position);
+        }
         self.handle_ime_composition_inner(*ctx, lparam)
     }
 
