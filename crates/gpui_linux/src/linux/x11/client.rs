@@ -477,8 +477,18 @@ impl X11Client {
                 move |event, _, client| match event {
                     XDPEvent::WindowAppearance(appearance) => {
                         client.with_common(|common| common.appearance = appearance);
-                        for window in client.0.borrow_mut().windows.values_mut() {
-                            window.window.set_appearance(appearance);
+                        // The callbacks below re-enter GPUI, which reaches back into this
+                        // `RefCell` through `with_common`, so the borrow has to be released
+                        // before notifying any window.
+                        let mut windows = client
+                            .0
+                            .borrow()
+                            .windows
+                            .values()
+                            .map(|window| window.window.clone())
+                            .collect::<Vec<_>>();
+                        for window in &mut windows {
+                            window.set_appearance(appearance);
                         }
                     }
                     XDPEvent::ButtonLayout(layout_str) => {
@@ -486,8 +496,15 @@ impl X11Client {
                             .log_err()
                             .unwrap_or_else(WindowButtonLayout::linux_default);
                         client.with_common(|common| common.button_layout = layout);
-                        for window in client.0.borrow_mut().windows.values_mut() {
-                            window.window.set_button_layout();
+                        let windows = client
+                            .0
+                            .borrow()
+                            .windows
+                            .values()
+                            .map(|window| window.window.clone())
+                            .collect::<Vec<_>>();
+                        for window in &windows {
+                            window.set_button_layout();
                         }
                     }
                     XDPEvent::CursorTheme(_) | XDPEvent::CursorSize(_) => {

@@ -623,11 +623,16 @@ impl WaylandClient {
                 move |event, _, client| match event {
                     XDPEvent::WindowAppearance(appearance) => {
                         if let Some(client) = client.0.upgrade() {
-                            let mut client = client.borrow_mut();
+                            // The callbacks below re-enter GPUI, which reaches back into
+                            // this `RefCell` through `with_common`, so the borrow has to be
+                            // released before notifying any window.
+                            let mut windows = {
+                                let mut client = client.borrow_mut();
+                                client.common.appearance = appearance;
+                                client.windows.values().cloned().collect::<Vec<_>>()
+                            };
 
-                            client.common.appearance = appearance;
-
-                            for window in client.windows.values_mut() {
+                            for window in &mut windows {
                                 window.set_appearance(appearance);
                             }
                         }
@@ -637,10 +642,13 @@ impl WaylandClient {
                             let layout = WindowButtonLayout::parse(&layout_str)
                                 .log_err()
                                 .unwrap_or_else(WindowButtonLayout::linux_default);
-                            let mut client = client.borrow_mut();
-                            client.common.button_layout = layout;
+                            let windows = {
+                                let mut client = client.borrow_mut();
+                                client.common.button_layout = layout;
+                                client.windows.values().cloned().collect::<Vec<_>>()
+                            };
 
-                            for window in client.windows.values_mut() {
+                            for window in &windows {
                                 window.set_button_layout();
                             }
                         }
