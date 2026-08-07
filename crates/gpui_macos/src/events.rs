@@ -32,6 +32,11 @@ pub fn key_to_native(key: &str) -> Cow<'_, str> {
         "space" => SPACE_KEY,
         "backspace" => BACKSPACE_KEY,
         "escape" => ESCAPE_KEY,
+        // Without these two, the fallback below hands NSMenuItem the literal
+        // string "enter", and AppKit takes its first character: a menu item
+        // bound to cmd-enter renders as ⌘E. The constants were already here.
+        "enter" => ENTER_KEY,
+        "tab" => TAB_KEY,
         "up" => NSUpArrowFunctionKey,
         "down" => NSDownArrowFunctionKey,
         "left" => NSLeftArrowFunctionKey,
