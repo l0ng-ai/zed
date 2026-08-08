@@ -1744,6 +1744,10 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+    /// The Acrylic backdrop material (DWMSBT_TRANSIENTWINDOW), supported on
+    /// Windows 11 22H2 and later. Below that, the Windows backend falls back
+    /// to the classic `ACCENT_ENABLE_ACRYLICBLURBEHIND` behavior of `Blurred`.
+    AcrylicBackdrop,
 }
 
 /// The text rendering mode to use for drawing glyphs.

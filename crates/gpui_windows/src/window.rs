@@ -844,13 +844,28 @@ impl PlatformWindow for WindowsWindow {
             WindowBackgroundAppearance::Blurred => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
             }
+            WindowBackgroundAppearance::AcrylicBackdrop => {
+                // DWMSBT_TRANSIENTWINDOW => Acrylic (Windows 11 22H2+).
+                // Same WCA-accent cleanup and frame refresh as Mica so a
+                // runtime switch away from another backdrop actually shows.
+                set_window_composition_attribute(hwnd, None, 0);
+                dwm_set_window_composition_attribute(hwnd, 3);
+                refresh_window_frame(hwnd);
+            }
             WindowBackgroundAppearance::MicaBackdrop => {
                 // DWMSBT_MAINWINDOW => MicaBase
+                // A WCA accent set earlier (transparent gradient / acrylic)
+                // keeps DWM from honoring DWMSBT, so disable it first, then
+                // nudge the frame so the new backdrop actually appears.
+                set_window_composition_attribute(hwnd, None, 0);
                 dwm_set_window_composition_attribute(hwnd, 2);
+                refresh_window_frame(hwnd);
             }
             WindowBackgroundAppearance::MicaAltBackdrop => {
                 // DWMSBT_TABBEDWINDOW => MicaAlt
+                set_window_composition_attribute(hwnd, None, 0);
                 dwm_set_window_composition_attribute(hwnd, 4);
+                refresh_window_frame(hwnd);
             }
         }
     }
@@ -1488,6 +1503,24 @@ fn retrieve_window_placement(
     let bounds = bounds.to_device_pixels(scale_factor);
     placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
     Ok(placement)
+}
+
+// DwmSetWindowAttribute alone does not repaint an existing backdrop; nudge
+// the frame (without moving or resizing) so DWM picks up the new DWMSBT
+// value immediately instead of on the next minimize/restore cycle.
+fn refresh_window_frame(hwnd: HWND) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+    }
+    .log_err();
 }
 
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
