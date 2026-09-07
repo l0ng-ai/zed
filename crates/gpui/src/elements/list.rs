@@ -70,6 +70,9 @@ struct StateInner {
     #[allow(clippy::type_complexity)]
     scroll_handler: Option<Box<dyn FnMut(&ListScrollEvent, &mut Window, &mut App)>>,
     scrollbar_drag_start_height: Option<Pixels>,
+    /// A height to count an item at until it has been laid out, if the list
+    /// was given one. See [`ListState::with_size_hint`].
+    size_hint: Option<Size<Pixels>>,
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
@@ -322,6 +325,7 @@ impl ListState {
             scroll_handler: None,
             reset: false,
             scrollbar_drag_start_height: None,
+            size_hint: None,
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
@@ -335,6 +339,40 @@ impl ListState {
     /// This is useful for ensuring that the scrollbar size is correct instead of based on only rendered elements.
     pub fn measure_all(self) -> Self {
         self.0.borrow_mut().measuring_behavior = ListMeasuringBehavior::Measure(false);
+        self
+    }
+
+    /// Count every item this list has not laid out yet as `height` tall.
+    ///
+    /// A list knows the height of the items it has measured and nothing about
+    /// the rest, so a long document that has never been scrolled through
+    /// reports a content height of about one viewport. A scrollbar reads that
+    /// as the whole document: its thumb fills the track, and dragging it from
+    /// top to bottom travels one viewport rather than to the end.
+    ///
+    /// A hint gives those items a height to be counted at until they are laid
+    /// out — an estimate, replaced by the real measurement as the reader
+    /// arrives — without [`Self::measure_all`]'s cost of laying out the whole
+    /// document on the first frame.
+    ///
+    /// The items already in the list take the hint too, so it can be set on a
+    /// state that has already been filled.
+    pub fn with_size_hint(self, height: Pixels) -> Self {
+        let size_hint = Some(size(px(0.), height));
+        {
+            let state = &mut *self.0.borrow_mut();
+            state.size_hint = size_hint;
+            state.items = SumTree::from_iter(
+                state.items.iter().map(|item| match item {
+                    ListItem::Unmeasured { focus_handle, .. } => ListItem::Unmeasured {
+                        size_hint,
+                        focus_handle: focus_handle.clone(),
+                    },
+                    measured => measured.clone(),
+                }),
+                (),
+            );
+        }
         self
     }
 
@@ -476,6 +514,7 @@ impl ListState {
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
     ) {
         let state = &mut *self.0.borrow_mut();
+        let size_hint = state.size_hint;
 
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
@@ -486,7 +525,7 @@ impl ListState {
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
                 ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint,
                     focus_handle,
                 }
             }),
@@ -1465,9 +1504,10 @@ impl Element for List {
             .last_layout_bounds
             .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
         {
+            let size_hint = state.size_hint;
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint,
                     focus_handle: item.focus_handle(),
                 }),
                 (),
