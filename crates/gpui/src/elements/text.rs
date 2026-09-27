@@ -618,6 +618,9 @@ struct TextLayoutInner {
     lines: SmallVec<[WrappedLine; 1]>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
+    /// The width the text was truncated to, if it was. A size measured under
+    /// truncation is no answer to a later measure that asks for the whole text.
+    truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
@@ -680,10 +683,16 @@ impl TextLayout {
                 // 2. wrap_width matches (or both are None)
                 // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
                 //    because the previous layout may have been computed without truncation)
+                // 4. the cached layout was not truncated either. A flex item is often measured
+                //    first against a squeezed width (a `flex_1` parent starts from a zero basis)
+                //    and then for its content size with no width at all; answering the second
+                //    from the first reports the text as just its ellipsis, and the item is laid
+                //    out that narrow however much room there is.
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
                     && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
                     && truncate_width.is_none()
+                    && text_layout.truncate_width.is_none()
                 {
                     return size;
                 }
@@ -731,6 +740,7 @@ impl TextLayout {
                         len: 0,
                         line_height,
                         wrap_width,
+                        truncate_width,
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -749,6 +759,7 @@ impl TextLayout {
                     len,
                     line_height,
                     wrap_width,
+                    truncate_width,
                     size: Some(size),
                     bounds: None,
                 });
