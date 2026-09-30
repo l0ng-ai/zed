@@ -342,12 +342,13 @@ fn paint_line(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    let line_bounds = Bounds::new(
+    let line_bounds = layer_bounds(
         origin,
-        size(
-            layout.width,
-            line_height * (wrap_boundaries.len() as f32 + 1.),
-        ),
+        layout,
+        line_height,
+        &align,
+        align_width,
+        wrap_boundaries,
     );
     window.paint_layer(line_bounds, |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
@@ -588,12 +589,13 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    let line_bounds = Bounds::new(
+    let line_bounds = layer_bounds(
         origin,
-        size(
-            layout.width,
-            line_height * (wrap_boundaries.len() as f32 + 1.),
-        ),
+        layout,
+        line_height,
+        &align,
+        align_width,
+        wrap_boundaries,
     );
     window.paint_layer(line_bounds, |window| {
         let mut decoration_runs = decoration_runs.iter();
@@ -726,6 +728,42 @@ fn paint_line_background(
     })
 }
 
+/// The paint layer a line's glyphs are drawn into.
+///
+/// It must cover where the glyphs actually land, not where an unaligned line
+/// would sit: the layer's bounds are what the scene uses to order the line
+/// against anything painted over it later. Right- or centre-aligned glyphs sit
+/// past `origin.x + layout.width`, so a layer of that size missed an opaque
+/// quad drawn over them afterwards; the two shared a draw order, sprites draw
+/// after quads within one, and the text showed through the quad.
+///
+/// Left-aligned text keeps its old bounds exactly. Otherwise the layer spans
+/// both the alignment box and the whole unwrapped line placed in it: a wrapped
+/// line is never wider than the unwrapped one, so it lands inside that too,
+/// and a line wider than its box (which aligns to a negative offset) is
+/// covered from its real start.
+fn layer_bounds(
+    origin: Point<Pixels>,
+    layout: &LineLayout,
+    line_height: Pixels,
+    align: &TextAlign,
+    align_width: Option<Pixels>,
+    wrap_boundaries: &[WrapBoundary],
+) -> Bounds<Pixels> {
+    let height = line_height * (wrap_boundaries.len() as f32 + 1.);
+    let (left, right) = match (align, align_width) {
+        (TextAlign::Left, _) | (_, None) => (origin.x, origin.x + layout.width),
+        (_, Some(align_width)) => {
+            let start = aligned_origin_x(origin, align_width, px(0.), align, layout, None);
+            (
+                origin.x.min(start),
+                (origin.x + align_width).max(start + layout.width),
+            )
+        }
+    };
+    Bounds::new(point(left, origin.y), size(right - left, height))
+}
+
 fn aligned_origin_x(
     origin: Point<Pixels>,
     align_width: Pixels,
@@ -787,6 +825,57 @@ mod tests {
             text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
         }
+    }
+
+    /// Where a line's first glyph lands, and where its last one ends.
+    fn glyph_span(line: &ShapedLine, align: TextAlign, align_width: f32) -> (Pixels, Pixels) {
+        let start = aligned_origin_x(
+            point(px(0.), px(0.)),
+            px(align_width),
+            px(0.),
+            &align,
+            &line.layout,
+            None,
+        );
+        (start, start + line.layout.width)
+    }
+
+    #[test]
+    fn test_layer_bounds_cover_aligned_glyphs() {
+        let line = make_shaped_line("ab", &[(0, 0.0), (1, 10.0)], 20.0, &[]);
+        let bounds = |align, align_width: Option<f32>| {
+            layer_bounds(
+                point(px(0.), px(0.)),
+                &line.layout,
+                px(16.),
+                &align,
+                align_width.map(px),
+                &[],
+            )
+        };
+
+        // Aligned inside a wider box: the glyphs sit at the far end of it,
+        // and the layer has to reach them.
+        for align in [TextAlign::Right, TextAlign::Center] {
+            let (start, end) = glyph_span(&line, align, 100.);
+            let layer = bounds(align, Some(100.));
+            assert!(
+                start > px(20.),
+                "{align:?}: the glyphs moved off the origin"
+            );
+            assert!(layer.left() <= start && layer.right() >= end, "{align:?}");
+        }
+
+        // Wider than its box: right alignment starts before the origin.
+        let (start, end) = glyph_span(&line, TextAlign::Right, 5.);
+        let layer = bounds(TextAlign::Right, Some(5.));
+        assert!(start < px(0.));
+        assert!(layer.left() <= start && layer.right() >= end);
+
+        // Left alignment is untouched: the box beyond the text is not claimed.
+        let layer = bounds(TextAlign::Left, Some(100.));
+        assert_eq!((layer.left(), layer.right()), (px(0.), px(20.)));
+        assert_eq!(layer.size.height, px(16.));
     }
 
     #[test]
