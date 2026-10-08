@@ -51,6 +51,8 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
+#[cfg(feature = "font-kit")]
+pub use text_system::set_glyph_dilation;
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

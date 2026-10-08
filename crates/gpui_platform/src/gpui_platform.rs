@@ -3,6 +3,11 @@
 
 pub use gpui::Platform;
 
+/// Turns glyph dilation (macOS font smoothing's stroke thickening) on or off
+/// for gpui's own text, without touching `AppleFontSmoothing`.
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+pub use gpui_macos::set_glyph_dilation;
+
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.

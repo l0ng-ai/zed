@@ -46,7 +46,15 @@ use pathfinder_geometry::{
     vector::Vector2F,
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    char,
+    convert::TryFrom,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::open_type::apply_features_and_fallbacks;
 
@@ -219,7 +227,7 @@ impl PlatformTextSystem for MacTextSystem {
         // When font smoothing is enabled, CoreGraphics thickens glyph strokes by an amount that
         // depends on the foreground color's luminance. We replicate the logic used by CoreGraphics
         // to select between the different levels of dilation.
-        if !font_smoothing_allowed_by_user() {
+        if !GLYPH_DILATION.load(Ordering::Relaxed) || !font_smoothing_allowed_by_user() {
             return 0;
         }
         let rgba: Rgba = color.into();
@@ -227,6 +235,23 @@ impl PlatformTextSystem for MacTextSystem {
         let level = ((4.0 * luminance) + 0.5).floor() as i32;
         level.clamp(0, 4) as u8
     }
+}
+
+static GLYPH_DILATION: AtomicBool = AtomicBool::new(true);
+
+/// Lets the application turn glyph dilation off for its own text, on top of
+/// what `AppleFontSmoothing` says.
+///
+/// Disabling dilation through `AppleFontSmoothing` means writing that
+/// preference somewhere this process reads it, and AppKit reads it too: menus,
+/// alerts and every other natively drawn string lose their smoothing along with
+/// gpui's glyphs. This switch reaches gpui's rasterizer alone. It never turns
+/// dilation on where the preference has it off.
+///
+/// Glyphs are cached per dilation level, so a change shows on the next frame
+/// that paints the text.
+pub fn set_glyph_dilation(enabled: bool) {
+    GLYPH_DILATION.store(enabled, Ordering::Relaxed);
 }
 
 fn font_smoothing_allowed_by_user() -> bool {
@@ -744,6 +769,24 @@ mod lenient_font_attributes {
 mod tests {
     use crate::MacTextSystem;
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+
+    #[test]
+    fn set_glyph_dilation_turns_dilation_off_and_back_on() {
+        use gpui::{Hsla, white};
+        let fonts = MacTextSystem::new();
+        let light: Hsla = white();
+        let allowed_by_user = fonts.glyph_dilation_for_color(light) > 0;
+
+        crate::set_glyph_dilation(false);
+        let off = fonts.glyph_dilation_for_color(light);
+        crate::set_glyph_dilation(true);
+        let on = fonts.glyph_dilation_for_color(light);
+
+        assert_eq!(off, 0);
+        // The switch only ever takes dilation away; whether it is there to
+        // begin with is the user's `AppleFontSmoothing`.
+        assert_eq!(on > 0, allowed_by_user);
+    }
 
     #[test]
     fn test_layout_line_bom_char() {
