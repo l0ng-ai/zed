@@ -196,10 +196,19 @@ impl MetalRenderer {
     }
 
     fn create_device() -> metal::Device {
+        let devices = metal::Device::all();
+        // A command-line build has no app bundle, so macOS cannot be asked to
+        // keep the high-performance GPU awake for it. Let the user opt in.
+        if std::env::var_os("TTY7_HIGH_PERFORMANCE_GPU").is_some() {
+            if let Some(device) = devices.iter().find(|device| !device.is_low_power()) {
+                log::info!("using high-performance Metal device: {}", device.name());
+                return device.clone();
+            }
+        }
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
-        if let Some(d) = metal::Device::all()
+        if let Some(d) = devices
             .into_iter()
             .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
         {
