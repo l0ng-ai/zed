@@ -27,7 +27,7 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{cell::Cell, collections::HashMap, ffi::c_void, mem, ptr, sync::Arc};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -36,9 +36,17 @@ pub(crate) type PointF = gpui::Point<f32>;
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
 #[cfg(feature = "runtime_shaders")]
 const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitched_shaders.metal"));
-// Use 4x MSAA, all devices support it.
-// https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
+// Paths are rasterized into tiles that cover only their bounds, so 4x
+// multisampling costs the paths' own area instead of the whole window.
 const PATH_SAMPLE_COUNT: u32 = 4;
+
+/// Rasterization targets for one path tile size. Paths are painted a row at a
+/// time, so a frame needs only a handful of sizes; caching them keeps a sidebar
+/// drag from allocating textures on every frame.
+struct PathTileTextures {
+    intermediate: metal::Texture,
+    msaa: Option<metal::Texture>,
+}
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
@@ -130,8 +138,10 @@ pub(crate) struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
-    path_intermediate_texture: Option<metal::Texture>,
-    path_intermediate_msaa_texture: Option<metal::Texture>,
+    /// Path rasterization targets keyed by quantized tile size. Paths usually
+    /// occupy a fraction of the window, so each cluster of paths gets a texture
+    /// that covers only its own bounds.
+    path_tiles: HashMap<(i32, i32), PathTileTextures>,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -186,10 +196,19 @@ impl MetalRenderer {
     }
 
     fn create_device() -> metal::Device {
+        let devices = metal::Device::all();
+        // A command-line build has no app bundle, so macOS cannot be asked to
+        // keep the high-performance GPU awake for it. Let the user opt in.
+        if std::env::var_os("TTY7_HIGH_PERFORMANCE_GPU").is_some() {
+            if let Some(device) = devices.iter().find(|device| !device.is_low_power()) {
+                log::info!("using high-performance Metal device: {}", device.name());
+                return device.clone();
+            }
+        }
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
-        if let Some(d) = metal::Device::all()
+        if let Some(d) = devices
             .into_iter()
             .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
         {
@@ -348,8 +367,7 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
-            path_intermediate_texture: None,
-            path_intermediate_msaa_texture: None,
+            path_tiles: HashMap::new(),
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
@@ -391,19 +409,23 @@ impl MetalRenderer {
                 ];
             }
         }
-        self.update_path_intermediate_textures(size);
     }
 
-    fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+    /// Make sure a path rasterization target exists for `size`.
+    ///
+    /// Paths are rasterized into an offscreen target and then copied onto the
+    /// drawable, so that target only has to cover the paths' bounding box -
+    /// usually a prompt line or a separator - instead of the whole window.
+    fn ensure_path_tile(&mut self, size: Size<DevicePixels>) -> bool {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            self.path_intermediate_texture = None;
-            self.path_intermediate_msaa_texture = None;
-            return;
+            return false;
         }
-
+        if self.path_tiles.contains_key(&(size.width.0, size.height.0)) {
+            return true;
+        }
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
         texture_descriptor.set_height(size.height.0 as u64);
@@ -411,9 +433,9 @@ impl MetalRenderer {
         texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
         texture_descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
+        let intermediate = self.device.new_texture(&texture_descriptor);
 
-        if self.path_sample_count > 1 {
+        let msaa = if self.path_sample_count > 1 {
             // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
             // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
             let storage_mode = if self.is_apple_gpu {
@@ -426,10 +448,21 @@ impl MetalRenderer {
             msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
             msaa_descriptor.set_storage_mode(storage_mode);
             msaa_descriptor.set_sample_count(self.path_sample_count as _);
-            self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
+            Some(self.device.new_texture(&msaa_descriptor))
         } else {
-            self.path_intermediate_msaa_texture = None;
-        }
+            None
+        };
+
+        self.path_tiles.insert(
+            (size.width.0, size.height.0),
+            PathTileTextures { intermediate, msaa },
+        );
+        true
+    }
+
+    fn path_tile_textures(&self, tile: Bounds<DevicePixels>) -> Option<&PathTileTextures> {
+        self.path_tiles
+            .get(&(tile.size.width.0, tile.size.height.0))
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -634,9 +667,6 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
         }
 
-        // Update path intermediate textures for this size
-        self.update_path_intermediate_textures(size);
-
         // Create an offscreen texture as render target
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
@@ -748,8 +778,6 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene: {:?}", size);
         }
 
-        self.update_path_intermediate_textures(size);
-
         let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
             texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
         });
@@ -836,6 +864,14 @@ impl MetalRenderer {
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
+        // A drag changes row widths by a few pixels per frame, so the cache
+        // would otherwise accumulate a target for every width it passed
+        // through. Dropping the lot is cheaper than tracking recency; textures
+        // released here are still retained by in-flight command buffers, and
+        // clearing before the frame keeps this frame's tiles alive.
+        if self.path_tiles.len() > 64 {
+            self.path_tiles.clear();
+        }
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -867,13 +903,34 @@ impl MetalRenderer {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
 
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        instance_buffer,
-                        &mut instance_offset,
-                        viewport_size,
-                        command_buffer,
-                    );
+                    // Rasterize the paths in clusters that are small enough to
+                    // stay close to the paths themselves: a single target for
+                    // the whole batch would span every prompt row on screen
+                    // and cost as much as the window-sized target it replaced.
+                    let clusters = path_clusters(paths, viewport_size);
+                    let mut did_draw = true;
+                    for (_, tile) in &clusters {
+                        did_draw &= self.ensure_path_tile(tile.size);
+                    }
+                    if did_draw {
+                        for (cluster, tile) in &clusters {
+                            let Some(textures) = self.path_tile_textures(*tile) else {
+                                did_draw = false;
+                                break;
+                            };
+                            did_draw = self.draw_paths_to_intermediate(
+                                cluster,
+                                instance_buffer,
+                                &mut instance_offset,
+                                *tile,
+                                textures,
+                                command_buffer,
+                            );
+                            if !did_draw {
+                                break;
+                            }
+                        }
+                    }
 
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
@@ -885,13 +942,25 @@ impl MetalRenderer {
                     );
 
                     if did_draw {
-                        self.draw_paths_from_intermediate(
-                            paths,
-                            instance_buffer,
-                            &mut instance_offset,
-                            viewport_size,
-                            command_encoder,
-                        )
+                        for (cluster, tile) in &clusters {
+                            let Some(textures) = self.path_tile_textures(*tile) else {
+                                did_draw = false;
+                                break;
+                            };
+                            did_draw = self.draw_paths_from_intermediate(
+                                cluster,
+                                instance_buffer,
+                                &mut instance_offset,
+                                viewport_size,
+                                *tile,
+                                &textures.intermediate,
+                                command_encoder,
+                            );
+                            if !did_draw {
+                                break;
+                            }
+                        }
+                        did_draw
                     } else {
                         false
                     }
@@ -963,15 +1032,13 @@ impl MetalRenderer {
         paths: &[Path<ScaledPixels>],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        tile: Bounds<DevicePixels>,
+        textures: &PathTileTextures,
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         if paths.is_empty() {
             return true;
         }
-        let Some(intermediate_texture) = &self.path_intermediate_texture else {
-            return false;
-        };
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -981,12 +1048,12 @@ impl MetalRenderer {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
 
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+        if let Some(msaa_texture) = &textures.msaa {
             color_attachment.set_texture(Some(msaa_texture));
-            color_attachment.set_resolve_texture(Some(intermediate_texture));
+            color_attachment.set_resolve_texture(Some(&textures.intermediate));
             color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
         } else {
-            color_attachment.set_texture(Some(intermediate_texture));
+            color_attachment.set_texture(Some(&textures.intermediate));
             color_attachment.set_store_action(metal::MTLStoreAction::Store);
         }
 
@@ -994,13 +1061,25 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
 
         align_offset(instance_offset);
+        let origin_x = tile.origin.x.0 as f32;
+        let origin_y = tile.origin.y.0 as f32;
         let mut vertices = Vec::new();
         for path in paths {
+            let bounds = path.bounds.intersect(&path.content_mask.bounds);
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
+                xy_position: point(
+                    ScaledPixels(v.xy_position.x.0 - origin_x),
+                    ScaledPixels(v.xy_position.y.0 - origin_y),
+                ),
                 st_position: v.st_position,
                 color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
+                bounds: Bounds {
+                    origin: point(
+                        ScaledPixels(bounds.origin.x.0 - origin_x),
+                        ScaledPixels(bounds.origin.y.0 - origin_y),
+                    ),
+                    size: bounds.size,
+                },
             }));
         }
         let vertices_bytes_len = mem::size_of_val(vertices.as_slice());
@@ -1016,8 +1095,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&tile.size) as u64,
+            &tile.size as *const Size<DevicePixels> as *const _,
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
@@ -1172,14 +1251,12 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
+        tile: Bounds<DevicePixels>,
+        intermediate_texture: &metal::TextureRef,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         let Some(first_path) = paths.first() else {
             return true;
-        };
-
-        let Some(ref intermediate_texture) = self.path_intermediate_texture else {
-            return false;
         };
 
         command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
@@ -1190,14 +1267,24 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&tile.size) as u64,
+            &tile.size as *const Size<DevicePixels> as *const _,
         );
 
         command_encoder.set_fragment_texture(
             SpriteInputIndex::AtlasTexture as u64,
             Some(intermediate_texture),
         );
+
+        let origin_x = tile.origin.x.0 as f32;
+        let origin_y = tile.origin.y.0 as f32;
+        let to_tile = |bounds: Bounds<ScaledPixels>| Bounds {
+            origin: point(
+                ScaledPixels(bounds.origin.x.0 - origin_x),
+                ScaledPixels(bounds.origin.y.0 - origin_y),
+            ),
+            size: bounds.size,
+        };
 
         // When copying paths from the intermediate texture to the drawable,
         // each pixel must only be copied once, in case of transparent paths.
@@ -1211,13 +1298,13 @@ impl MetalRenderer {
             sprites = paths
                 .iter()
                 .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
+                    bounds: to_tile(path.clipped_bounds()),
                 })
                 .collect();
         } else {
-            let mut bounds = first_path.clipped_bounds();
+            let mut bounds = to_tile(first_path.clipped_bounds());
             for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
+                bounds = bounds.union(&to_tile(path.clipped_bounds()));
             }
             sprites = vec![PathSprite { bounds }];
         }
@@ -1245,12 +1332,31 @@ impl MetalRenderer {
             );
         }
 
+        // The sprites are in tile space: draw them through a viewport that maps
+        // the tile onto the drawable at the position the paths occupy, then
+        // restore the full viewport for the batches that follow.
+        command_encoder.set_viewport(metal::MTLViewport {
+            originX: origin_x as f64,
+            originY: origin_y as f64,
+            width: tile.size.width.0 as f64,
+            height: tile.size.height.0 as f64,
+            znear: 0.,
+            zfar: 1.,
+        });
         command_encoder.draw_primitives_instanced(
             metal::MTLPrimitiveType::Triangle,
             0,
             6,
             sprites.len() as u64,
         );
+        command_encoder.set_viewport(metal::MTLViewport {
+            originX: 0.,
+            originY: 0.,
+            width: viewport_size.width.0 as f64,
+            height: viewport_size.height.0 as f64,
+            znear: 0.,
+            zfar: 1.,
+        });
         *instance_offset = next_offset;
 
         true
@@ -1564,6 +1670,88 @@ impl MetalRenderer {
             *instance_offset = next_offset;
         }
         true
+    }
+}
+
+/// Split a path batch into runs that can share one rasterization target.
+///
+/// Paths arrive in paint order and the terminal paints a row's powerline cells
+/// and box-drawing pieces consecutively, so keeping a run together while its
+/// union stays within a couple of text lines yields one small target per row.
+/// A single target for the whole batch would span every row on screen.
+fn path_clusters<'a>(
+    paths: &'a [Path<ScaledPixels>],
+    viewport_size: Size<DevicePixels>,
+) -> Vec<(&'a [Path<ScaledPixels>], Bounds<DevicePixels>)> {
+    const MAX_TILE_HEIGHT: f32 = 128.;
+
+    let mut clusters = Vec::new();
+    let mut start = 0;
+    let mut union: Option<Bounds<ScaledPixels>> = None;
+    for (index, path) in paths.iter().enumerate() {
+        let bounds = path.clipped_bounds();
+        let merged = match union {
+            Some(union) => union.union(&bounds),
+            None => bounds,
+        };
+        if merged.size.height.0 > MAX_TILE_HEIGHT && index > start {
+            clusters.push((
+                &paths[start..index],
+                path_tile_bounds(union.unwrap(), viewport_size),
+            ));
+            start = index;
+            union = Some(bounds);
+        } else {
+            union = Some(merged);
+        }
+    }
+    if let Some(union) = union {
+        clusters.push((&paths[start..], path_tile_bounds(union, viewport_size)));
+    }
+    clusters
+}
+
+/// The pixel region one path cluster has to cover, padded for antialiasing and
+/// rounded up so a prompt that scrolls keeps reusing one allocation.
+fn path_tile_bounds(
+    union: Bounds<ScaledPixels>,
+    viewport_size: Size<DevicePixels>,
+) -> Bounds<DevicePixels> {
+    const STEP_WIDTH: i32 = 64;
+    const STEP_HEIGHT: i32 = 16;
+    const MARGIN: f32 = 2.;
+    let viewport_width = viewport_size.width.0 as f32;
+    let viewport_height = viewport_size.height.0 as f32;
+    let left = (union.origin.x.0 - MARGIN)
+        .clamp(0., viewport_width)
+        .floor() as i32;
+    let top = (union.origin.y.0 - MARGIN)
+        .clamp(0., viewport_height)
+        .floor() as i32;
+    let right = (union.origin.x.0 + union.size.width.0 + MARGIN)
+        .clamp(0., viewport_width)
+        .ceil() as i32;
+    let bottom = (union.origin.y.0 + union.size.height.0 + MARGIN)
+        .clamp(0., viewport_height)
+        .ceil() as i32;
+    if right <= left || bottom <= top {
+        // Nothing visible, but a path cluster still needs a target to draw into.
+        return Bounds {
+            origin: point(
+                DevicePixels(left.min(viewport_size.width.0 - 1)),
+                DevicePixels(top.min(viewport_size.height.0 - 1)),
+            ),
+            size: size(DevicePixels(1), DevicePixels(1)),
+        };
+    }
+
+    let width = ((right - left + STEP_WIDTH - 1) / STEP_WIDTH * STEP_WIDTH)
+        .min(viewport_size.width.0 - left);
+    let height = ((bottom - top + STEP_HEIGHT - 1) / STEP_HEIGHT * STEP_HEIGHT)
+        .min(viewport_size.height.0 - top);
+    Bounds {
+        origin: point(DevicePixels(left), DevicePixels(top)),
+        size: size(DevicePixels(width), DevicePixels(height)),
     }
 }
 
